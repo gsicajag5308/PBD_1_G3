@@ -1,0 +1,408 @@
+/*==============================================================================
+  PUNTO 6
+  MODULO DE DETECCION DE FRAUDE BASADO EN CONSULTAS OPTIMIZADAS
+==============================================================================*/
+
+ALTER SESSION SET "_ORACLE_SCRIPT" = true;
+
+SET SERVEROUTPUT ON;
+
+PROMPT ============================================================
+PROMPT MODULO DE DETECCION DE FRAUDE
+PROMPT ============================================================
+
+
+/*==============================================================================
+  1. CONSULTA DE TRANSFERENCIAS DE MONTO ELEVADO
+  -------------------------------------------------------------------------------
+  Detecta transferencias cuyo monto sea superior a Q5,000.
+  Este valor coincide con el criterio utilizado anteriormente en el FGA.
+==============================================================================*/
+
+PROMPT
+PROMPT 1. TRANSFERENCIAS DE MONTO ELEVADO
+PROMPT ------------------------------------------------------------
+
+SELECT
+    T.ID_TRANSFERENCIA,
+    CO.NUMERO_CUENTA AS CUENTA_ORIGEN,
+    CD.NUMERO_CUENTA AS CUENTA_DESTINO,
+    T.MONTO,
+    T.FECHA_TRANSACCION,
+    T.ID_USUARIO,
+    E.NOMBRE_ESTADO AS ESTADO
+FROM BANCO_CORE.TRANSFERENCIAS T
+INNER JOIN BANCO_CORE.CUENTAS CO
+    ON T.ID_CUENTA_ORIGEN = CO.ID_CUENTA
+INNER JOIN BANCO_CORE.CUENTAS CD
+    ON T.ID_CUENTA_DESTINO = CD.ID_CUENTA
+INNER JOIN BANCO_CATALOGO.ESTADOS_TRANSFERENCIA E
+    ON T.ID_ESTADO_TRANSFERENCIA = E.ID_ESTADO_TRANSFERENCIA
+WHERE T.MONTO > 5000
+ORDER BY T.MONTO DESC;
+
+
+/*==============================================================================
+  2. TRANSFERENCIAS QUE REPRESENTAN UNA PARTE IMPORTANTE DEL SALDO
+  -------------------------------------------------------------------------------
+  Se compara el monto transferido contra el saldo actual de la cuenta origen.
+  Puede identificar operaciones que representan un porcentaje elevado
+  del dinero disponible.
+==============================================================================*/
+
+PROMPT
+PROMPT 2. TRANSFERENCIAS ELEVADAS RESPECTO AL SALDO
+PROMPT ------------------------------------------------------------
+
+SELECT
+    T.ID_TRANSFERENCIA,
+    CO.NUMERO_CUENTA AS CUENTA_ORIGEN,
+    CO.SALDO AS SALDO_ACTUAL,
+    T.MONTO,
+    ROUND((T.MONTO / NULLIF(CO.SALDO + T.MONTO, 0)) * 100, 2)
+        AS PORCENTAJE_OPERACION,
+    T.FECHA_TRANSACCION
+FROM BANCO_CORE.TRANSFERENCIAS T
+INNER JOIN BANCO_CORE.CUENTAS CO
+    ON T.ID_CUENTA_ORIGEN = CO.ID_CUENTA
+WHERE T.MONTO >= (CO.SALDO + T.MONTO) * 0.50
+ORDER BY PORCENTAJE_OPERACION DESC;
+
+
+/*==============================================================================
+  3. USUARIOS CON MUCHAS TRANSFERENCIAS
+  -------------------------------------------------------------------------------
+  Identifica usuarios que hayan realizado 3 o más transferencias.
+  Esto permite detectar actividad transaccional elevada.
+==============================================================================*/
+
+PROMPT
+PROMPT 3. USUARIOS CON ALTA CANTIDAD DE TRANSFERENCIAS
+PROMPT ------------------------------------------------------------
+
+SELECT
+    U.ID_USUARIO,
+    U.NOMBRE_USUARIO,
+    U.NOMBRE_COMPLETO,
+    COUNT(T.ID_TRANSFERENCIA) AS CANTIDAD_TRANSFERENCIAS,
+    SUM(T.MONTO) AS MONTO_TOTAL_TRANSFERIDO
+FROM BANCO_CORE.USUARIOS_SISTEMA U
+INNER JOIN BANCO_CORE.TRANSFERENCIAS T
+    ON U.ID_USUARIO = T.ID_USUARIO
+GROUP BY
+    U.ID_USUARIO,
+    U.NOMBRE_USUARIO,
+    U.NOMBRE_COMPLETO
+HAVING COUNT(T.ID_TRANSFERENCIA) >= 3
+ORDER BY CANTIDAD_TRANSFERENCIAS DESC;
+
+
+/*==============================================================================
+  4. CUENTAS CON ALTA ACTIVIDAD TRANSACCIONAL
+  -------------------------------------------------------------------------------
+  Cuenta las transferencias en las que una cuenta participa como origen
+  o como destino.
+==============================================================================*/
+
+PROMPT
+PROMPT 4. CUENTAS CON ALTA ACTIVIDAD TRANSACCIONAL
+PROMPT ------------------------------------------------------------
+
+SELECT
+    C.ID_CUENTA,
+    C.NUMERO_CUENTA,
+    COUNT(T.ID_TRANSFERENCIA) AS CANTIDAD_OPERACIONES,
+    SUM(
+        CASE
+            WHEN T.ID_CUENTA_ORIGEN = C.ID_CUENTA
+            THEN T.MONTO
+            ELSE 0
+        END
+    ) AS TOTAL_DEBITADO,
+    SUM(
+        CASE
+            WHEN T.ID_CUENTA_DESTINO = C.ID_CUENTA
+            THEN T.MONTO
+            ELSE 0
+        END
+    ) AS TOTAL_RECIBIDO
+FROM BANCO_CORE.CUENTAS C
+INNER JOIN BANCO_CORE.TRANSFERENCIAS T
+    ON C.ID_CUENTA = T.ID_CUENTA_ORIGEN
+    OR C.ID_CUENTA = T.ID_CUENTA_DESTINO
+GROUP BY
+    C.ID_CUENTA,
+    C.NUMERO_CUENTA
+HAVING COUNT(T.ID_TRANSFERENCIA) >= 3
+ORDER BY CANTIDAD_OPERACIONES DESC;
+
+
+/*==============================================================================
+  5. TRANSFERENCIAS REALIZADAS POR ENCIMA DE Q10,000
+  -------------------------------------------------------------------------------
+  Segundo nivel de alerta para operaciones de monto considerable.
+==============================================================================*/
+
+PROMPT
+PROMPT 5. TRANSFERENCIAS DE MONTO MUY ELEVADO
+PROMPT ------------------------------------------------------------
+
+SELECT
+    T.ID_TRANSFERENCIA,
+    CO.NUMERO_CUENTA AS CUENTA_ORIGEN,
+    CD.NUMERO_CUENTA AS CUENTA_DESTINO,
+    T.MONTO,
+    T.FECHA_TRANSACCION,
+    U.NOMBRE_USUARIO,
+    E.NOMBRE_ESTADO
+FROM BANCO_CORE.TRANSFERENCIAS T
+INNER JOIN BANCO_CORE.CUENTAS CO
+    ON T.ID_CUENTA_ORIGEN = CO.ID_CUENTA
+INNER JOIN BANCO_CORE.CUENTAS CD
+    ON T.ID_CUENTA_DESTINO = CD.ID_CUENTA
+LEFT JOIN BANCO_CORE.USUARIOS_SISTEMA U
+    ON T.ID_USUARIO = U.ID_USUARIO
+INNER JOIN BANCO_CATALOGO.ESTADOS_TRANSFERENCIA E
+    ON T.ID_ESTADO_TRANSFERENCIA = E.ID_ESTADO_TRANSFERENCIA
+WHERE T.MONTO > 10000
+ORDER BY T.MONTO DESC;
+
+
+/*==============================================================================
+  6. TRANSFERENCIAS PENDIENTES O RECHAZADAS DE MONTO ALTO
+  -------------------------------------------------------------------------------
+  Busca operaciones de monto elevado que no hayan terminado como
+  transferencias completadas.
+==============================================================================*/
+
+PROMPT
+PROMPT 6. OPERACIONES DE MONTO ALTO NO COMPLETADAS
+PROMPT ------------------------------------------------------------
+
+SELECT
+    T.ID_TRANSFERENCIA,
+    T.MONTO,
+    T.FECHA_TRANSACCION,
+    CO.NUMERO_CUENTA AS CUENTA_ORIGEN,
+    CD.NUMERO_CUENTA AS CUENTA_DESTINO,
+    E.NOMBRE_ESTADO AS ESTADO
+FROM BANCO_CORE.TRANSFERENCIAS T
+INNER JOIN BANCO_CORE.CUENTAS CO
+    ON T.ID_CUENTA_ORIGEN = CO.ID_CUENTA
+INNER JOIN BANCO_CORE.CUENTAS CD
+    ON T.ID_CUENTA_DESTINO = CD.ID_CUENTA
+INNER JOIN BANCO_CATALOGO.ESTADOS_TRANSFERENCIA E
+    ON T.ID_ESTADO_TRANSFERENCIA = E.ID_ESTADO_TRANSFERENCIA
+WHERE T.MONTO > 5000
+  AND E.NOMBRE_ESTADO IN ('PENDIENTE', 'CANCELADA', 'RECHAZADA')
+ORDER BY T.FECHA_TRANSACCION DESC;
+
+
+/*==============================================================================
+  7. MOVIMIENTOS DE DÉBITO ELEVADOS
+  -------------------------------------------------------------------------------
+  Analiza la tabla MOVIMIENTOS_CUENTA para encontrar débitos
+  superiores a Q5,000.
+==============================================================================*/
+
+PROMPT
+PROMPT 7. MOVIMIENTOS DE DEBITO ELEVADO
+PROMPT ------------------------------------------------------------
+
+SELECT
+    M.ID_MOVIMIENTO,
+    C.NUMERO_CUENTA,
+    M.DEBITO,
+    M.SALDO_RESULTANTE,
+    M.FECHA,
+    M.ID_TRANSFERENCIA
+FROM BANCO_CORE.MOVIMIENTOS_CUENTA M
+INNER JOIN BANCO_CORE.CUENTAS C
+    ON M.ID_CUENTA = C.ID_CUENTA
+WHERE M.DEBITO > 5000
+ORDER BY M.DEBITO DESC;
+
+
+/*==============================================================================
+  8. CLIENTES CON CUENTAS Y ACTIVIDAD DE TRANSFERENCIAS
+  -------------------------------------------------------------------------------
+  Relaciona clientes, cuentas y transferencias para identificar
+  clientes con actividad transaccional.
+==============================================================================*/
+
+PROMPT
+PROMPT 8. ACTIVIDAD TRANSACCIONAL POR CLIENTE
+PROMPT ------------------------------------------------------------
+
+SELECT
+    C.ID_CLIENTE,
+    C.NOMBRES || ' ' || C.APELLIDOS AS CLIENTE,
+    CU.NUMERO_CUENTA,
+    CU.SALDO,
+    COUNT(T.ID_TRANSFERENCIA) AS CANTIDAD_TRANSFERENCIAS,
+    NVL(SUM(T.MONTO), 0) AS MONTO_TOTAL
+FROM BANCO_CORE.CLIENTES C
+INNER JOIN BANCO_CORE.CUENTAS CU
+    ON C.ID_CLIENTE = CU.ID_CLIENTE
+LEFT JOIN BANCO_CORE.TRANSFERENCIAS T
+    ON CU.ID_CUENTA = T.ID_CUENTA_ORIGEN
+    OR CU.ID_CUENTA = T.ID_CUENTA_DESTINO
+GROUP BY
+    C.ID_CLIENTE,
+    C.NOMBRES,
+    C.APELLIDOS,
+    CU.NUMERO_CUENTA,
+    CU.SALDO
+ORDER BY MONTO_TOTAL DESC;
+
+
+/*==============================================================================
+  9. RESUMEN DE ALERTAS
+  -------------------------------------------------------------------------------
+  Genera una clasificación sencilla de las transferencias según el monto.
+==============================================================================*/
+
+PROMPT
+PROMPT 9. RESUMEN DE ALERTAS POR MONTO
+PROMPT ------------------------------------------------------------
+
+SELECT
+    T.ID_TRANSFERENCIA,
+    T.MONTO,
+    CASE
+        WHEN T.MONTO > 10000 THEN 'ALERTA MUY ALTA'
+        WHEN T.MONTO > 5000 THEN 'ALERTA ALTA'
+        WHEN T.MONTO > 3000 THEN 'REVISION'
+        ELSE 'NORMAL'
+    END AS NIVEL_ALERTA,
+    T.FECHA_TRANSACCION
+FROM BANCO_CORE.TRANSFERENCIAS T
+ORDER BY T.MONTO DESC;
+
+
+/*==============================================================================
+  10. CONSULTA OPTIMIZADA PARA DETECCION GENERAL
+  -------------------------------------------------------------------------------
+  Consulta principal del módulo.
+  Combina transferencia, cuenta origen, cuenta destino y usuario.
+==============================================================================*/
+
+PROMPT
+PROMPT 10. CONSULTA PRINCIPAL DE DETECCION DE FRAUDE
+PROMPT ------------------------------------------------------------
+
+SELECT
+    T.ID_TRANSFERENCIA,
+    CO.NUMERO_CUENTA AS CUENTA_ORIGEN,
+    CD.NUMERO_CUENTA AS CUENTA_DESTINO,
+    T.MONTO,
+    CO.SALDO AS SALDO_ORIGEN,
+    U.NOMBRE_USUARIO,
+    T.FECHA_TRANSACCION,
+    CASE
+        WHEN T.MONTO > 10000 THEN 'ALERTA MUY ALTA'
+        WHEN T.MONTO > 5000 THEN 'ALERTA ALTA'
+        WHEN T.MONTO >= CO.SALDO * 0.50 THEN 'ALERTA POR PORCENTAJE'
+        ELSE 'NORMAL'
+    END AS ALERTA
+FROM BANCO_CORE.TRANSFERENCIAS T
+INNER JOIN BANCO_CORE.CUENTAS CO
+    ON T.ID_CUENTA_ORIGEN = CO.ID_CUENTA
+INNER JOIN BANCO_CORE.CUENTAS CD
+    ON T.ID_CUENTA_DESTINO = CD.ID_CUENTA
+LEFT JOIN BANCO_CORE.USUARIOS_SISTEMA U
+    ON T.ID_USUARIO = U.ID_USUARIO
+WHERE T.MONTO > 5000
+   OR T.MONTO >= CO.SALDO * 0.50
+ORDER BY T.MONTO DESC;
+
+
+/*==============================================================================
+  11. EXPLICAR PLAN DE EJECUCION
+  -------------------------------------------------------------------------------
+  Permite revisar cómo Oracle ejecuta la consulta principal.
+==============================================================================*/
+
+PROMPT
+PROMPT 11. PLAN DE EJECUCION
+PROMPT ------------------------------------------------------------
+
+EXPLAIN PLAN FOR
+SELECT
+    T.ID_TRANSFERENCIA,
+    T.MONTO,
+    T.FECHA_TRANSACCION,
+    CO.NUMERO_CUENTA AS CUENTA_ORIGEN,
+    CD.NUMERO_CUENTA AS CUENTA_DESTINO
+FROM BANCO_CORE.TRANSFERENCIAS T
+INNER JOIN BANCO_CORE.CUENTAS CO
+    ON T.ID_CUENTA_ORIGEN = CO.ID_CUENTA
+INNER JOIN BANCO_CORE.CUENTAS CD
+    ON T.ID_CUENTA_DESTINO = CD.ID_CUENTA
+WHERE T.MONTO > 5000;
+
+SELECT *
+FROM TABLE(DBMS_XPLAN.DISPLAY);
+
+
+/*==============================================================================
+  12. INDICES PARA OPTIMIZAR LAS CONSULTAS
+  -------------------------------------------------------------------------------
+  Los índices ayudan a Oracle a localizar rápidamente las transferencias
+  utilizadas por las consultas del módulo.
+==============================================================================*/
+
+PROMPT
+PROMPT 12. CREACION DE INDICES
+PROMPT ------------------------------------------------------------
+
+CREATE INDEX BANCO_CORE.IDX_TRANS_MONTO
+ON BANCO_CORE.TRANSFERENCIAS(MONTO);
+
+CREATE INDEX BANCO_CORE.IDX_TRANS_FECHA
+ON BANCO_CORE.TRANSFERENCIAS(FECHA_TRANSACCION);
+
+CREATE INDEX BANCO_CORE.IDX_TRANS_USUARIO
+ON BANCO_CORE.TRANSFERENCIAS(ID_USUARIO);
+
+CREATE INDEX BANCO_CORE.IDX_TRANS_ORIGEN
+ON BANCO_CORE.TRANSFERENCIAS(ID_CUENTA_ORIGEN);
+
+CREATE INDEX BANCO_CORE.IDX_TRANS_DESTINO
+ON BANCO_CORE.TRANSFERENCIAS(ID_CUENTA_DESTINO);
+
+CREATE INDEX BANCO_CORE.IDX_MOV_CUENTA_FECHA
+ON BANCO_CORE.MOVIMIENTOS_CUENTA(ID_CUENTA, FECHA);
+
+COMMIT;
+
+
+/*==============================================================================
+  13. VERIFICAR LOS INDICES CREADOS
+==============================================================================*/
+
+PROMPT
+PROMPT 13. INDICES DEL MODULO DE FRAUDE
+PROMPT ------------------------------------------------------------
+
+SELECT
+    INDEX_NAME,
+    TABLE_NAME,
+    STATUS
+FROM DBA_INDEXES
+WHERE OWNER = 'BANCO_CORE'
+  AND INDEX_NAME IN (
+      'IDX_TRANS_MONTO',
+      'IDX_TRANS_FECHA',
+      'IDX_TRANS_USUARIO',
+      'IDX_TRANS_ORIGEN',
+      'IDX_TRANS_DESTINO',
+      'IDX_MOV_CUENTA_FECHA'
+  )
+ORDER BY INDEX_NAME;
+
+
+PROMPT
+PROMPT ============================================================
+PROMPT MODULO DE DETECCION DE FRAUDE FINALIZADO
+PROMPT ============================================================
