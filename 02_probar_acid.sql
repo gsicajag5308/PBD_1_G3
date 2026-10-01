@@ -1,0 +1,89 @@
+-- Ejecutar después de instalar 01_instalar_acid.sql.
+-- La prueba transfiere Q100 de 001-0001 hacia 001-0002.
+
+-- Revisamos los saldos antes de transferir.
+SELECT ID_CUENTA, NUMERO_CUENTA, SALDO
+FROM BANCO_CORE.CUENTAS
+WHERE NUMERO_CUENTA IN ('001-0001', '001-0002')
+ORDER BY NUMERO_CUENTA;
+
+DECLARE
+    v_cuenta_origen   NUMBER;
+    v_cuenta_destino  NUMBER;
+    v_usuario         NUMBER;
+    v_transferencia   NUMBER;
+BEGIN
+    SELECT ID_CUENTA
+    INTO v_cuenta_origen
+    FROM BANCO_CORE.CUENTAS
+    WHERE NUMERO_CUENTA = '001-0001';
+
+    SELECT ID_CUENTA
+    INTO v_cuenta_destino
+    FROM BANCO_CORE.CUENTAS
+    WHERE NUMERO_CUENTA = '001-0002';
+
+    SELECT ID_USUARIO
+    INTO v_usuario
+    FROM BANCO_CORE.USUARIOS_SISTEMA
+    WHERE NOMBRE_USUARIO = 'operador1';
+
+    BANCO_CORE.REALIZAR_TRANSFERENCIA(
+        p_id_cuenta_origen  => v_cuenta_origen,
+        p_id_cuenta_destino => v_cuenta_destino,
+        p_monto             => 100,
+        p_id_usuario        => v_usuario,
+        p_id_transferencia  => v_transferencia
+    );
+END;
+/
+
+-- Revisamos los saldos después de transferir.
+-- Si al principio eran Q5,000 y Q1,500, ahora serán Q4,900 y Q1,600.
+SELECT ID_CUENTA, NUMERO_CUENTA, SALDO
+FROM BANCO_CORE.CUENTAS
+WHERE NUMERO_CUENTA IN ('001-0001', '001-0002')
+ORDER BY NUMERO_CUENTA;
+
+-- Revisamos la transferencia que acabamos de crear.
+SELECT T.ID_TRANSFERENCIA,
+       CO.NUMERO_CUENTA AS CUENTA_ORIGEN,
+       CD.NUMERO_CUENTA AS CUENTA_DESTINO,
+       T.MONTO,
+       E.NOMBRE_ESTADO,
+       T.FECHA_TRANSACCION
+FROM BANCO_CORE.TRANSFERENCIAS T
+JOIN BANCO_CORE.CUENTAS CO
+  ON CO.ID_CUENTA = T.ID_CUENTA_ORIGEN
+JOIN BANCO_CORE.CUENTAS CD
+  ON CD.ID_CUENTA = T.ID_CUENTA_DESTINO
+JOIN BANCO_CATALOGO.ESTADOS_TRANSFERENCIA E
+  ON E.ID_ESTADO_TRANSFERENCIA = T.ID_ESTADO_TRANSFERENCIA
+WHERE T.ID_TRANSFERENCIA = (
+    SELECT MAX(ID_TRANSFERENCIA)
+    FROM BANCO_CORE.TRANSFERENCIAS
+);
+
+-- Deben aparecer dos movimientos: un débito y un crédito de Q100.
+SELECT M.ID_MOVIMIENTO,
+       C.NUMERO_CUENTA,
+       TM.NOMBRE_TIPO,
+       M.DEBITO,
+       M.CREDITO,
+       M.SALDO_RESULTANTE
+FROM BANCO_CORE.MOVIMIENTOS_CUENTA M
+JOIN BANCO_CORE.CUENTAS C
+  ON C.ID_CUENTA = M.ID_CUENTA
+JOIN BANCO_CATALOGO.TIPOS_MOVIMIENTO TM
+  ON TM.ID_TIPO_MOVIMIENTO = M.ID_TIPO_MOVIMIENTO
+WHERE M.ID_TRANSFERENCIA = (
+    SELECT MAX(ID_TRANSFERENCIA)
+    FROM BANCO_CORE.TRANSFERENCIAS
+)
+ORDER BY M.ID_MOVIMIENTO;
+
+-- El total entre las dos cuentas debe conservarse.
+SELECT SUM(SALDO) AS TOTAL_ENTRE_AMBAS_CUENTAS
+FROM BANCO_CORE.CUENTAS
+WHERE NUMERO_CUENTA IN ('001-0001', '001-0002');
+
