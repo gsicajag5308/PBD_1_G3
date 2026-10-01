@@ -1,0 +1,48 @@
+--==============================================================================
+-- ELIMINACIÓN DE TRIGGERS EXISTENTES
+-- Ejecutar conectado como SYS, SYSTEM o BANCO_CORE (con privilegios)
+--==============================================================================
+
+ALTER SESSION SET "_ORACLE_SCRIPT" = true;
+
+
+-- Deshabilitar primero (buena práctica)
+BEGIN
+    EXECUTE IMMEDIATE 'ALTER TRIGGER BANCO_CORE.TRG_PREVENIR_SOBREGIRO DISABLE';
+EXCEPTION
+    WHEN OTHERS THEN NULL;   -- si no existe, ignorar
+END;
+/
+
+BEGIN
+    EXECUTE IMMEDIATE 'ALTER TRIGGER BANCO_CORE.TRG_AUDITORIA_CUENTAS DISABLE';
+EXCEPTION
+    WHEN OTHERS THEN NULL;
+END;
+/
+
+-- Eliminar
+BEGIN
+    EXECUTE IMMEDIATE 'DROP TRIGGER BANCO_CORE.TRG_PREVENIR_SOBREGIRO';
+    DBMS_OUTPUT.PUT_LINE('TRG_PREVENIR_SOBREGIRO eliminado.');
+EXCEPTION
+    WHEN OTHERS THEN
+        DBMS_OUTPUT.PUT_LINE('TRG_PREVENIR_SOBREGIRO no existía o ya fue eliminado.');
+END;
+/
+
+BEGIN
+    EXECUTE IMMEDIATE 'DROP TRIGGER BANCO_CORE.TRG_AUDITORIA_CUENTAS';
+    DBMS_OUTPUT.PUT_LINE('TRG_AUDITORIA_CUENTAS eliminado.');
+EXCEPTION
+    WHEN OTHERS THEN
+        DBMS_OUTPUT.PUT_LINE('TRG_AUDITORIA_CUENTAS no existía o ya fue eliminado.');
+END;
+/
+
+-- Verificación
+SELECT TRIGGER_NAME, STATUS
+FROM   DBA_TRIGGERS
+WHERE  OWNER = 'BANCO_CORE'
+ORDER  BY TRIGGER_NAME;
+
