@@ -1,0 +1,290 @@
+/*==============================================================================
+  PARTICIONAMIENTO SIN TOCAR TABLAS ORIGINALES
+  Estrategia: Originales (OLTP) → ST (staging) → Tabla Particionada (Analítica)
+  Esquema: BANCO_CORE
+==============================================================================*/
+ALTER SESSION SET "_ORACLE_SCRIPT" = true;
+SET SERVEROUTPUT ON SIZE UNLIMITED;
+
+--==============================================================================
+-- 1. LIMPIEZA PREVIA SI EXIST
+--==============================================================================
+BEGIN
+  FOR t IN (
+    SELECT table_name FROM dba_tables
+    WHERE owner = 'BANCO_CORE'
+      AND table_name IN (
+        'ST_TRANSFERENCIAS', 'ST_MOVIMIENTOS',
+        'TRANSFERENCIAS_PART', 'MOVIMIENTOS_PART'
+      )
+  ) LOOP
+    EXECUTE IMMEDIATE 'DROP TABLE BANCO_CORE.' || t.table_name || ' PURGE';
+    DBMS_OUTPUT.PUT_LINE('Eliminada: ' || t.table_name);
+  END LOOP;
+END;
+/
+
+
+--==============================================================================
+-- 2. TABLAS STAGING (ST) - estructura idéntica a las originales + PARTITION_DATE
+--==============================================================================
+CREATE TABLE BANCO_CORE.ST_TRANSFERENCIAS (
+    ID_TRANSFERENCIA        NUMBER,
+    ID_CUENTA_ORIGEN        NUMBER,
+    ID_CUENTA_DESTINO       NUMBER,
+    MONTO                   NUMBER(18,2),
+    ID_ESTADO_TRANSFERENCIA NUMBER,
+    FECHA_TRANSACCION       TIMESTAMP,
+    ID_USUARIO              NUMBER,
+    DESCRIPCION             VARCHAR2(200),
+    PARTITION_DATE          DATE,          -- se calcula en el procedimiento
+    FECHA_CARGA             TIMESTAMP DEFAULT SYSTIMESTAMP
+);
+
+CREATE TABLE BANCO_CORE.ST_MOVIMIENTOS (
+    ID_MOVIMIENTO       NUMBER,
+    ID_CUENTA           NUMBER,
+    ID_TIPO_MOVIMIENTO  NUMBER,
+    DEBITO              NUMBER(18,2),
+    CREDITO             NUMBER(18,2),
+    SALDO_RESULTANTE    NUMBER(18,2),
+    FECHA               TIMESTAMP,
+    ID_TRANSFERENCIA    NUMBER,
+    PARTITION_DATE      DATE,              -- se calcula en el procedimiento
+    FECHA_CARGA         TIMESTAMP DEFAULT SYSTIMESTAMP
+);
+
+
+--==============================================================================
+-- 3. TABLAS PARTICIONADAS (resumen / analíticas)
+--==============================================================================
+CREATE TABLE BANCO_CORE.TRANSFERENCIAS_PART (
+    ID_TRANSFERENCIA        NUMBER,
+    ID_CUENTA_ORIGEN        NUMBER NOT NULL,
+    ID_CUENTA_DESTINO       NUMBER NOT NULL,
+    MONTO                   NUMBER(18,2) NOT NULL,
+    ID_ESTADO_TRANSFERENCIA NUMBER NOT NULL,
+    FECHA_TRANSACCION       TIMESTAMP NOT NULL,
+    PARTITION_DATE          DATE NOT NULL,
+    ID_USUARIO              NUMBER,
+    DESCRIPCION             VARCHAR2(200),
+    CONSTRAINT PK_TRANSFERENCIAS_PART PRIMARY KEY (ID_TRANSFERENCIA, PARTITION_DATE)
+)
+PARTITION BY RANGE (PARTITION_DATE) (
+    PARTITION P_2026_09 VALUES LESS THAN (DATE '2026-10-01'),
+    PARTITION P_2026_10 VALUES LESS THAN (DATE '2026-11-01'),
+    PARTITION P_2026_11 VALUES LESS THAN (DATE '2026-12-01'),
+    PARTITION P_2026_12 VALUES LESS THAN (DATE '2027-01-01'),
+    PARTITION P_2027_01 VALUES LESS THAN (DATE '2027-02-01'),
+    PARTITION P_2027_02 VALUES LESS THAN (DATE '2027-03-01'),
+    PARTITION P_2027_03 VALUES LESS THAN (DATE '2027-04-01'),
+    PARTITION P_2027_04 VALUES LESS THAN (DATE '2027-05-01'),
+    PARTITION P_FUTURO  VALUES LESS THAN (MAXVALUE)
+);
+
+CREATE TABLE BANCO_CORE.MOVIMIENTOS_PART (
+    ID_MOVIMIENTO       NUMBER,
+    ID_CUENTA           NUMBER NOT NULL,
+    ID_TIPO_MOVIMIENTO  NUMBER NOT NULL,
+    DEBITO              NUMBER(18,2) DEFAULT 0 NOT NULL,
+    CREDITO             NUMBER(18,2) DEFAULT 0 NOT NULL,
+    SALDO_RESULTANTE    NUMBER(18,2) NOT NULL,
+    FECHA               TIMESTAMP NOT NULL,
+    PARTITION_DATE      DATE NOT NULL,
+    ID_TRANSFERENCIA    NUMBER,
+    CONSTRAINT PK_MOVIMIENTOS_PART PRIMARY KEY (ID_MOVIMIENTO, PARTITION_DATE)
+)
+PARTITION BY RANGE (PARTITION_DATE) (
+		PARTITION P_2026_09 VALUES LESS THAN (DATE '2026-10-01'),
+		PARTITION P_2026_10 VALUES LESS THAN (DATE '2026-11-01'),
+		PARTITION P_2026_11 VALUES LESS THAN (DATE '2026-12-01'),
+		PARTITION P_2026_12 VALUES LESS THAN (DATE '2027-01-01'),
+		PARTITION P_2027_01 VALUES LESS THAN (DATE '2027-02-01'),
+		PARTITION P_2027_02 VALUES LESS THAN (DATE '2027-03-01'),
+		PARTITION P_2027_03 VALUES LESS THAN (DATE '2027-04-01'),
+		PARTITION P_2027_04 VALUES LESS THAN (DATE '2027-05-01'),
+	);
+
+-- Índices locales en las particionadas
+CREATE INDEX BANCO_CORE.IDX_TP_MONTO       ON BANCO_CORE.TRANSFERENCIAS_PART (MONTO) LOCAL;
+CREATE INDEX BANCO_CORE.IDX_TP_FECHA       ON BANCO_CORE.TRANSFERENCIAS_PART (FECHA_TRANSACCION) LOCAL;
+CREATE INDEX BANCO_CORE.IDX_TP_ORIGEN      ON BANCO_CORE.TRANSFERENCIAS_PART (ID_CUENTA_ORIGEN) LOCAL;
+CREATE INDEX BANCO_CORE.IDX_TP_DESTINO     ON BANCO_CORE.TRANSFERENCIAS_PART (ID_CUENTA_DESTINO) LOCAL;
+
+CREATE INDEX BANCO_CORE.IDX_MP_CUENTA_FECHA ON BANCO_CORE.MOVIMIENTOS_PART (ID_CUENTA, FECHA) LOCAL;
+CREATE INDEX BANCO_CORE.IDX_MP_PDATE        ON BANCO_CORE.MOVIMIENTOS_PART (PARTITION_DATE) LOCAL;
+
+
+
+--==============================================================================
+-- 4. PROCEDIMIENTO 1: Llenar tablas ST desde las originales
+--==============================================================================
+CREATE OR REPLACE PROCEDURE BANCO_CORE.PRC_CARGAR_ST (
+    p_fecha_desde IN DATE DEFAULT NULL,   -- si es NULL carga todo
+    p_fecha_hasta IN DATE DEFAULT NULL
+) AS
+    v_desde DATE := NVL(p_fecha_desde, DATE '1900-01-01');
+    v_hasta DATE := NVL(p_fecha_hasta, DATE '9999-12-31');
+BEGIN
+    -- Limpiar staging
+    EXECUTE IMMEDIATE 'TRUNCATE TABLE BANCO_CORE.ST_TRANSFERENCIAS';
+    EXECUTE IMMEDIATE 'TRUNCATE TABLE BANCO_CORE.ST_MOVIMIENTOS';
+
+    -- Cargar TRANSFERENCIAS → ST
+    INSERT INTO BANCO_CORE.ST_TRANSFERENCIAS (
+        ID_TRANSFERENCIA, ID_CUENTA_ORIGEN, ID_CUENTA_DESTINO, MONTO,
+        ID_ESTADO_TRANSFERENCIA, FECHA_TRANSACCION, ID_USUARIO, DESCRIPCION,
+        PARTITION_DATE
+    )
+    SELECT
+        ID_TRANSFERENCIA,
+        ID_CUENTA_ORIGEN,
+        ID_CUENTA_DESTINO,
+        MONTO,
+        ID_ESTADO_TRANSFERENCIA,
+        FECHA_TRANSACCION,
+        ID_USUARIO,
+        DESCRIPCION,                                    -- si no existe la columna, comenta esta línea
+        TRUNC(CAST(FECHA_TRANSACCION AS DATE))          -- clave de partición
+    FROM BANCO_CORE.TRANSFERENCIAS
+    WHERE TRUNC(CAST(FECHA_TRANSACCION AS DATE)) BETWEEN v_desde AND v_hasta;
+
+    -- Cargar MOVIMIENTOS → ST
+    INSERT INTO BANCO_CORE.ST_MOVIMIENTOS (
+        ID_MOVIMIENTO, ID_CUENTA, ID_TIPO_MOVIMIENTO,
+        DEBITO, CREDITO, SALDO_RESULTANTE, FECHA, ID_TRANSFERENCIA,
+        PARTITION_DATE
+    )
+    SELECT
+        ID_MOVIMIENTO,
+        ID_CUENTA,
+        ID_TIPO_MOVIMIENTO,
+        DEBITO,
+        CREDITO,
+        SALDO_RESULTANTE,
+        FECHA,
+        ID_TRANSFERENCIA,
+        TRUNC(CAST(FECHA AS DATE))
+    FROM BANCO_CORE.MOVIMIENTOS_CUENTA
+    WHERE TRUNC(CAST(FECHA AS DATE)) BETWEEN v_desde AND v_hasta;
+
+    COMMIT;
+
+    DBMS_OUTPUT.PUT_LINE('ST_TRANSFERENCIAS cargadas: ' || SQL%ROWCOUNT);
+    -- Nota: el segundo INSERT ya hizo COMMIT, por eso usamos COUNT aparte si quieres precisión
+END;
+/
+
+--==============================================================================
+-- 5. PROCEDIMIENTO 2: Llenar tablas particionadas desde las ST
+--==============================================================================
+CREATE OR REPLACE PROCEDURE BANCO_CORE.PRC_CARGAR_PARTICIONADAS (
+    p_modo IN VARCHAR2 DEFAULT 'INCREMENTAL'   -- 'FULL' o 'INCREMENTAL'
+) AS
+BEGIN
+    IF UPPER(p_modo) = 'FULL' THEN
+        -- Borrar todo y recargar
+        EXECUTE IMMEDIATE 'TRUNCATE TABLE BANCO_CORE.TRANSFERENCIAS_PART';
+        EXECUTE IMMEDIATE 'TRUNCATE TABLE BANCO_CORE.MOVIMIENTOS_PART';
+    END IF;
+
+    -- Cargar TRANSFERENCIAS_PART (evita duplicados por PK)
+    MERGE INTO BANCO_CORE.TRANSFERENCIAS_PART tgt
+    USING (
+        SELECT * FROM BANCO_CORE.ST_TRANSFERENCIAS
+    ) src
+    ON (tgt.ID_TRANSFERENCIA = src.ID_TRANSFERENCIA
+        AND tgt.PARTITION_DATE = src.PARTITION_DATE)
+    WHEN NOT MATCHED THEN
+        INSERT (
+            ID_TRANSFERENCIA, ID_CUENTA_ORIGEN, ID_CUENTA_DESTINO, MONTO,
+            ID_ESTADO_TRANSFERENCIA, FECHA_TRANSACCION, PARTITION_DATE,
+            ID_USUARIO, DESCRIPCION
+        )
+        VALUES (
+            src.ID_TRANSFERENCIA, src.ID_CUENTA_ORIGEN, src.ID_CUENTA_DESTINO, src.MONTO,
+            src.ID_ESTADO_TRANSFERENCIA, src.FECHA_TRANSACCION, src.PARTITION_DATE,
+            src.ID_USUARIO, src.DESCRIPCION
+        );
+
+    -- Cargar MOVIMIENTOS_PART
+    MERGE INTO BANCO_CORE.MOVIMIENTOS_PART tgt
+    USING (
+        SELECT * FROM BANCO_CORE.ST_MOVIMIENTOS
+    ) src
+    ON (tgt.ID_MOVIMIENTO = src.ID_MOVIMIENTO
+        AND tgt.PARTITION_DATE = src.PARTITION_DATE)
+    WHEN NOT MATCHED THEN
+        INSERT (
+            ID_MOVIMIENTO, ID_CUENTA, ID_TIPO_MOVIMIENTO,
+            DEBITO, CREDITO, SALDO_RESULTANTE, FECHA,
+            PARTITION_DATE, ID_TRANSFERENCIA
+        )
+        VALUES (
+            src.ID_MOVIMIENTO, src.ID_CUENTA, src.ID_TIPO_MOVIMIENTO,
+            src.DEBITO, src.CREDITO, src.SALDO_RESULTANTE, src.FECHA,
+            src.PARTITION_DATE, src.ID_TRANSFERENCIA
+        );
+
+    COMMIT;
+    DBMS_OUTPUT.PUT_LINE('Carga a tablas particionadas finalizada (modo: ' || p_modo || ')');
+END;
+/
+
+CREATE OR REPLACE PROCEDURE BANCO_CORE.PRC_REFRESCAR_PARTICIONES (
+    p_fecha_desde IN DATE     DEFAULT NULL,
+    p_fecha_hasta IN DATE     DEFAULT NULL,
+    p_modo        IN VARCHAR2 DEFAULT 'INCREMENTAL'
+) AS
+BEGIN
+    DBMS_OUTPUT.PUT_LINE('=== Inicio refresco de particiones ===');
+    
+    BANCO_CORE.PRC_CARGAR_ST(p_fecha_desde, p_fecha_hasta);
+    BANCO_CORE.PRC_CARGAR_PARTICIONADAS(p_modo);
+    
+    DBMS_OUTPUT.PUT_LINE('=== Refresco completado ===');
+END;
+/
+
+
+--==============================================================================
+-- 7. EJEMPLOS DE USO
+--==============================================================================
+/*
+-- Carga completa (primera vez)
+EXEC BANCO_CORE.PRC_REFRESCAR_PARTICIONES(NULL, NULL, 'FULL');
+
+-- Carga incremental de un rango de fechas
+BEGIN
+  BANCO_CORE.PRC_REFRESCAR_PARTICIONES(
+      DATE '2026-10-01',
+      DATE '2026-11-30',
+      'INCREMENTAL'
+  );
+END;
+/
+
+-- Solo llenar ST
+EXEC BANCO_CORE.PRC_CARGAR_ST;
+
+-- Solo pasar de ST a particionadas
+EXEC BANCO_CORE.PRC_CARGAR_PARTICIONADAS('INCREMENTAL');
+*/
+
+
+--==============================================================================
+-- 8. VERIFICACIÓN
+--==============================================================================
+SELECT 'ST_TRANSFERENCIAS' AS TABLA, COUNT(*) AS FILAS FROM BANCO_CORE.ST_TRANSFERENCIAS
+UNION ALL
+SELECT 'ST_MOVIMIENTOS', COUNT(*) FROM BANCO_CORE.ST_MOVIMIENTOS
+UNION ALL
+SELECT 'TRANSFERENCIAS_PART', COUNT(*) FROM BANCO_CORE.TRANSFERENCIAS_PART
+UNION ALL
+SELECT 'MOVIMIENTOS_PART', COUNT(*) FROM BANCO_CORE.MOVIMIENTOS_PART;
+
+SELECT TABLE_NAME, PARTITION_NAME, HIGH_VALUE
+FROM DBA_TAB_PARTITIONS
+WHERE TABLE_OWNER = 'BANCO_CORE'
+  AND TABLE_NAME IN ('TRANSFERENCIAS_PART', 'MOVIMIENTOS_PART')
+ORDER BY TABLE_NAME, PARTITION_POSITION;
